@@ -1,0 +1,85 @@
+name: tp1-2pc-demo
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tp1-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  account-a:
+    build: ./services/account
+    container_name: tp1-account-a
+    environment:
+      - ACCOUNT_NAME=A
+      - INITIAL_BALANCE=1000
+      - DATA_PATH=/data
+    volumes:
+      - account_a_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8001:8000"   # para testes locais
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: on-failure
+
+  account-b:
+    build: ./services/account
+    container_name: tp1-account-b
+    environment:
+      - ACCOUNT_NAME=B
+      - INITIAL_BALANCE=100
+      - DATA_PATH=/data
+    volumes:
+      - account_b_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8002:8000"   # para testes locais
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: on-failure
+
+  api:
+    build: ./services/api
+    container_name: tp1-api
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - PARTICIPANT_A_URL=http://account-a:8000
+      - PARTICIPANT_B_URL=http://account-b:8000
+      - JWT_SECRET=dev-secret
+      - RECOVERY_ROLLBACK_TIMEOUT_SECONDS=10
+    depends_on:
+      redis:
+        condition: service_healthy
+      account-a:
+        condition: service_healthy
+      account-b:
+        condition: service_healthy
+    ports:
+      - "8080:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: on-failure
+
+volumes:
+  account_a_data:
+  account_b_data:
