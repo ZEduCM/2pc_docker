@@ -1,4 +1,4 @@
-# README.md — TP1: 2PC (Two‑Phase Commit) Bank Transfer
+# TP1: 2PC (Two‑Phase Commit) Bank Transfer
 
 ## 🧭 Objetivo Geral
 
