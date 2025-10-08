@@ -1,72 +1,152 @@
+# Declara os parâmetros que o script aceita. -NoBuild é um switch.
 param(
-  [switch]$NoBuild
+    [switch]$NoBuild
 )
 
-$ErrorActionPreference = "Stop"
-$TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0ZXIiLCJpYXQiOjE3NTk3OTU3MzcsImV4cCI6MTc5MTMzMTczN30.wkw6HfDEixe9F409vmtz0ldElcLAxmutXi4nWsUmFy8"
+# Configurações de "modo estrito" do PowerShell, similar ao 'set -euo pipefail' do Bash
+$ErrorActionPreference = "Stop" # Para o script em caso de erro
+Set-StrictMode -Version Latest # Garante que variáveis não inicializadas causem erro
 
-if (!$NoBuild) {
-  docker compose up -d --build
-} else {
-  docker compose up -d
+# --- Variáveis Iniciais ---
+$Token = "eyJhbGciOiJIUzI1NiIsInRpyCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0ZXIiLCJpYXQiOjE3NTk3OTU3MzcsImV4cCI6MTc5MTMzMTczN30.wkw6HfDEixe9F409vmtz0ldElcLAxmutXi4nWsUmFy8"
+$ApiHeaders = @{
+    "Authorization" = "Bearer $Token"
+    "Content-Type"  = "application/json"
 }
 
-Write-Host "Aguardando healthchecks..."
-function Wait-URL($url) {
-  for ($i=0; $i -lt 60; $i++) {
-    try { Invoke-RestMethod -Uri $url -TimeoutSec 2 | Out-Null; return } catch { Start-Sleep -Seconds 1 }
-  }
-  throw "Timeout no healthcheck: $url"
+# --- Inicialização dos Containers ---
+if ($NoBuild.IsPresent) {
+    Write-Host "Iniciando containers sem build..."
+    docker compose up -d
+}
+else {
+    Write-Host "Fazendo build e iniciando containers..."
+    docker compose up -d --build
 }
 
-Wait-URL http://localhost:8080/healthz
-Wait-URL http://localhost:8001/healthz
-Wait-URL http://localhost:8002/healthz
+# --- Função de Healthcheck ---
+function Wait-Url {
+    param(
+        [string]$Url
+    )
+    
+    Write-Host "Aguardando healthcheck para: $Url"
+    foreach ($i in 1..60) {
+        try {
+            # Invoke-WebRequest silencia o output e joga o erro fora se falhar
+            Invoke-WebRequest -Uri $Url -UseBasicParsing | Out-Null
+            Write-Host "$Url está disponível."
+            return # Sai da função com sucesso
+        }
+        catch {
+            # Se der erro, espera 1 segundo e tenta de novo
+            Start-Sleep -Seconds 1
+        }
+    }
+    # Se o loop terminar, o timeout foi atingido
+    Write-Error "Timeout no healthcheck: $Url"
+    exit 1
+}
 
-# Saldos iniciais
-$balA0 = Invoke-RestMethod http://localhost:8001/balance
-$balB0 = Invoke-RestMethod http://localhost:8002/balance
+Wait-Url "http://localhost:8080/healthz"
+Wait-Url "http://localhost:8001/healthz"
+Wait-Url "http://localhost:8002/healthz"
+Write-Host "Todos os serviços estão online."
 
-# 1) Transferência OK + idempotência
-$k1 = [Guid]::NewGuid().ToString()
-$body1 = @{ from_account="A"; to_account="B"; amount=50; idempotency_key=$k1 } | ConvertTo-Json
-$res1 = Invoke-RestMethod -Uri http://localhost:8080/transfer -Method POST -Headers @{Authorization="Bearer $TOKEN"} -ContentType application/json -Body $body1
-$res1b = Invoke-RestMethod -Uri http://localhost:8080/transfer -Method POST -Headers @{Authorization="Bearer $TOKEN"} -ContentType application/json -Body $body1
-$idem_ok = ($res1.transaction_id -eq $res1b.transaction_id)
+# --- Execução dos Testes ---
+
+# Saldos iniciais (Invoke-RestMethod já converte o JSON para um objeto PowerShell)
+$balA0 = Invoke-RestMethod -Uri "http://localhost:8001/balance"
+$balB0 = Invoke-RestMethod -Uri "http://localhost:8002/balance"
+
+# 1) Transferência OK + Idempotência
+Write-Host "1) Testando transferência OK e idempotência..."
+$k1 = [guid]::NewGuid().ToString()
+$body1 = @{
+    from_account    = "A"
+    to_account      = "B"
+    amount          = 50
+    idempotency_key = $k1
+} | ConvertTo-Json -Compress
+
+$res1 = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/transfer" -Headers $ApiHeaders -Body $body1
+$res1b = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/transfer" -Headers $ApiHeaders -Body $body1
+
+$idemOk = if ($res1.transaction_id -eq $res1b.transaction_id) { "true" } else { "false" }
+Write-Host "Verificação de idempotência: $idemOk"
 
 # 2) Crash coordenador após PREPARE → recovery (rollback)
-$k2 = [Guid]::NewGuid().ToString()
-$sim2 = @{ from_account="A"; to_account="B"; amount=10; idempotency_key=$k2; simulate=@{ crash_coordinator_after_prepare=$true } } | ConvertTo-Json
-try { Invoke-RestMethod -Uri http://localhost:8080/transfer -Method POST -Headers @{Authorization="Bearer $TOKEN"} -ContentType application/json -Body $sim2 | Out-Null } catch { }
+Write-Host "2) Testando crash do coordenador (requisição irá falhar)..."
+$k2 = [guid]::NewGuid().ToString()
+$body2 = @{
+    from_account    = "A"
+    to_account      = "B"
+    amount          = 10
+    idempotency_key = $k2
+    simulate        = @{ crash_coordinator_after_prepare = $true }
+} | ConvertTo-Json -Compress
+
+# Usamos try/catch para ignorar o erro esperado de "Connection reset"
+try {
+    Invoke-RestMethod -Method Post -Uri "http://localhost:8080/transfer" -Headers $ApiHeaders -Body $body2
+} catch {
+    Write-Warning "A requisição falhou como esperado (crash do coordenador)."
+}
+Write-Host "Aguardando 12 segundos para o processo de recovery..."
 Start-Sleep -Seconds 12
 
 # 3) Crash participante A após PREPARE → abort/rollback
-$k3 = [Guid]::NewGuid().ToString()
-$sim3 = @{ from_account="A"; to_account="B"; amount=10; idempotency_key=$k3; simulate=@{ crash_participant=@{ name="A"; stage="after_prepare" } } } | ConvertTo-Json
-try { Invoke-RestMethod -Uri http://localhost:8080/transfer -Method POST -Headers @{Authorization="Bearer $TOKEN"} -ContentType application/json -Body $sim3 | Out-Null } catch { }
+Write-Host "3) Testando crash do participante A (requisição irá retornar erro)..."
+$k3 = [guid]::NewGuid().ToString()
+$body3 = @{
+    from_account    = "A"
+    to_account      = "B"
+    amount          = 10
+    idempotency_key = $k3
+    simulate        = @{ crash_participant = @{ name = "A"; stage = "after_prepare" } }
+} | ConvertTo-Json -Compress
+
+# Usamos try/catch para ignorar o erro HTTP 409 (Conflict) esperado
+try {
+    Invoke-RestMethod -Method Post -Uri "http://localhost:8080/transfer" -Headers $ApiHeaders -Body $body3
+} catch {
+    Write-Warning "A transação foi abortada como esperado (crash do participante)."
+}
+Write-Host "Aguardando 8 segundos..."
 Start-Sleep -Seconds 8
 
+
+# --- Coleta de Dados Finais ---
 # Saldos finais
-$balA1 = Invoke-RestMethod http://localhost:8001/balance
-$balB1 = Invoke-RestMethod http://localhost:8002/balance
+$balA1 = Invoke-RestMethod -Uri "http://localhost:8001/balance"
+$balB1 = Invoke-RestMethod -Uri "http://localhost:8002/balance"
 
 # Métricas
-$metAPI = Invoke-RestMethod http://localhost:8080/metrics
-$metA = Invoke-RestMethod http://localhost:8001/metrics
-$metB = Invoke-RestMethod http://localhost:8002/metrics
+$metAPI = Invoke-RestMethod -Uri "http://localhost:8080/metrics"
+$metA = Invoke-RestMethod -Uri "http://localhost:8001/metrics"
+$metB = Invoke-RestMethod -Uri "http://localhost:8002/metrics"
 
-# Resumo
-Write-Host "==== RESUMO ====" -ForegroundColor Cyan
-Write-Host ("A: {0} → {1}" -f $balA0.balance, $balA1.balance)
-Write-Host ("B: {0} → {1}" -f $balB0.balance, $balB1.balance)
-Write-Host ("Idempotência (k1) OK: {0}" -f $idem_ok)
-Write-Host "--- Métricas API ---" -ForegroundColor Yellow
-Write-Host $metAPI
+# --- Resumo ---
+Write-Host ""
+Write-Host "==== RESUMO ===="
+# Acessa diretamente a propriedade .balance do objeto retornado
+Write-Host "A: $($balA0.balance) → $($balA1.balance)"
+Write-Host "B: $($balB0.balance) → $($balB1.balance)"
+
+Write-Host "--- Métricas API ---"
+$metAPI
+
 Write-Host "--- Métricas A ---"
-Write-Host $metA
+$metA
+
 Write-Host "--- Métricas B ---"
-Write-Host $metB
+$metB
 
 # Logs (curtos)
-Write-Host "--- Últimos logs ---" -ForegroundColor Yellow
-try { docker compose logs --no-color --tail=50 } catch { }
+Write-Host "--- Últimos logs ---"
+# O || true do bash é para ignorar erros. Um try/catch faz o mesmo em PowerShell.
+try {
+    docker compose logs --no-color --tail=20
+} catch {
+    Write-Warning "Não foi possível obter os logs do Docker."
+}
